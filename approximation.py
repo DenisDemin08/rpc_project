@@ -1,57 +1,50 @@
 """
 Пункт 3.7 – Аппроксимация (E,N)->(B,L) по значащим пикселям TIFF.
-Используется JAX, SGD с моментом, ранняя остановка.
+PyTorch + CUDA, ранняя остановка, выбор оптимизатора SGD/Adam.
 """
 
 import numpy as np
-import jax
-import jax.numpy as jnp
-from jax import grad, jit, vmap, random, value_and_grad
-from functools import partial
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+import glob
 from osgeo import gdal
 
 # ------------------------------------------------------------
-#  Инициализация MLP
+#  MLP на PyTorch
 # ------------------------------------------------------------
-def init_mlp_params(rng_key, layer_sizes):
-    params = []
-    keys = random.split(rng_key, len(layer_sizes))
-    for n_in, n_out in zip(layer_sizes[:-1], layer_sizes[1:]):
-        w = random.normal(keys[0], (n_in, n_out)) * jnp.sqrt(2.0 / n_in)
-        b = jnp.zeros((n_out,))
-        params.append((w, b))
-        keys = keys[1:]
-    return params
+class MLP(nn.Module):
+    def __init__(self, layer_sizes):
+        super().__init__()
+        self.layers = nn.ModuleList()
+        for i in range(len(layer_sizes) - 1):
+            self.layers.append(nn.Linear(layer_sizes[i], layer_sizes[i+1]))
+        self.activation = nn.Tanh()
 
-def mlp_forward(params, x):
-    for w, b in params[:-1]:
-        x = jnp.tanh(x @ w + b)
-    w_last, b_last = params[-1]
-    return x @ w_last + b_last
+    def forward(self, x):
+        for layer in self.layers[:-1]:
+            x = self.activation(layer(x))
+        x = self.layers[-1](x)   # без активации на выходе
+        return x
 
 # ------------------------------------------------------------
-#  Функция потерь
+#  Нормализация
 # ------------------------------------------------------------
-def mse_loss(params, x, y):
-    y_pred = vmap(partial(mlp_forward, params))(x)
-    return jnp.mean((y_pred - y) ** 2)
+def normalize_utm(points, E_center, E_scale, N_center, N_scale):
+    E_n = (points[:, 0] - E_center) / E_scale
+    N_n = (points[:, 1] - N_center) / N_scale
+    return torch.stack([E_n, N_n], dim=1)
 
-# ------------------------------------------------------------
-#  SGD с моментом
-# ------------------------------------------------------------
-def init_momentum(params):
-    return [(jnp.zeros_like(w), jnp.zeros_like(b)) for w, b in params]
+def normalize_bl(y, B_mean, B_std, L_mean, L_std):
+    B_n = (y[:, 0] - B_mean) / B_std
+    L_n = (y[:, 1] - L_mean) / L_std
+    return torch.stack([B_n, L_n], dim=1)
 
-def momentum_update(params, grads, velocity, lr=1e-3, momentum=0.9):
-    new_params, new_vel = [], []
-    for (w, b), (dw, db), (vw, vb) in zip(params, grads, velocity):
-        vw = momentum * vw + lr * dw
-        vb = momentum * vb + lr * db
-        w_new = w - vw
-        b_new = b - vb
-        new_params.append((w_new, b_new))
-        new_vel.append((vw, vb))
-    return new_params, new_vel
+def denormalize_bl(y_norm, B_mean, B_std, L_mean, L_std):
+    B = y_norm[:, 0] * B_std + B_mean
+    L = y_norm[:, 1] * L_std + L_mean
+    return torch.stack([B, L], dim=1)
 
 # ------------------------------------------------------------
 #  Точное преобразование UTM -> (B,L) через GDAL
@@ -65,14 +58,9 @@ def exact_bl(utm_points, utm_to_wgs84):
     return np.column_stack([lats, lons])
 
 # ------------------------------------------------------------
-#  Получение значащих пикселей из TIFF
+#  Загрузка значащих пикселей из TIFF
 # ------------------------------------------------------------
 def load_valid_pixels_from_tiff(tiff_path, geotf):
-    """
-    Возвращает координаты центров значащих пикселей (E,N).
-    geotf — GeoTransform в формате GDAL (список из 6 элементов).
-    Считаем значащими все пиксели, не равные 0 и не NoData.
-    """
     ds = gdal.Open(tiff_path)
     if ds is None:
         raise FileNotFoundError(f"Не удалось открыть {tiff_path}")
@@ -81,39 +69,88 @@ def load_valid_pixels_from_tiff(tiff_path, geotf):
     nodata = band.GetNoDataValue()
     ds = None
 
-    # Маска значащих пикселей
     if nodata is not None:
         valid = (data != 0) & (data != nodata)
     else:
         valid = data != 0
 
     rows, cols = np.where(valid)
-    # Координаты центров пикселей
     x_coords = geotf[0] + (cols + 0.5) * geotf[1] + (rows + 0.5) * geotf[2]
     y_coords = geotf[3] + (cols + 0.5) * geotf[4] + (rows + 0.5) * geotf[5]
     return np.column_stack([x_coords, y_coords])
 
 # ------------------------------------------------------------
-#  Генерация выборок из значащих пикселей
+#  Генерация выборок
 # ------------------------------------------------------------
-def generate_datasets_from_tiff(tiff_path, geotf, coef = 8, max_points=256):
+def generate_datasets_from_tiff(tiff_path, geotf, coef=8, max_points=16384):
     all_points = load_valid_pixels_from_tiff(tiff_path, geotf)
     print(f"Найдено значащих пикселей: {len(all_points)}")
     if len(all_points) == 0:
         raise RuntimeError("Нет значащих пикселей в изображении")
-    # Перемешиваем и ограничиваем количество
     idx = np.random.permutation(len(all_points))
     all_points = all_points[idx[:]]
     train_points = all_points[:max_points]
-    test_points = all_points[:max_points*coef]
+    test_points = all_points[:max_points * coef]
     return train_points, test_points
+
+# ------------------------------------------------------------
+#  Пиксельная ошибка (средняя / максимальная)
+# ------------------------------------------------------------
+def compute_pixel_error(model, points_orig, X_norm, rpc, height, utm_to_wgs84,
+                        denorm_params, device):
+    model.eval()
+    with torch.no_grad():
+        X_t = torch.as_tensor(X_norm, dtype=torch.float32, device=device)
+        y_pred_norm = model(X_t).cpu().numpy()
+    B_mean, B_std, L_mean, L_std = denorm_params
+    y_pred = y_pred_norm * np.array([B_std, L_std]) + np.array([B_mean, L_mean])
+
+    errs = []
+    for (E, N), (Bp, Lp) in zip(points_orig, y_pred):
+        n_pred, m_pred = rpc.forward(Bp, Lp, height)
+        lon_true, lat_true, _ = utm_to_wgs84.TransformPoint(E, N)
+        n_true, m_true = rpc.forward(lat_true, lon_true, height)
+        errs.append(np.hypot(m_pred - m_true, n_pred - n_true))
+    errs = np.array(errs)
+    return errs.mean(), errs.max()
+
+# ------------------------------------------------------------
+#  Вычисление градусных и пиксельных метрик
+# ------------------------------------------------------------
+def compute_metrics(model, points_orig, X_norm, y_true, denorm_params, rpc, height,
+                    utm_to_wgs84, device):
+    model.eval()
+    with torch.no_grad():
+        X_t = torch.as_tensor(X_norm, dtype=torch.float32, device=device)
+        y_pred_norm = model(X_t).cpu().numpy()
+    B_mean, B_std, L_mean, L_std = denorm_params
+    y_pred = y_pred_norm * np.array([B_std, L_std]) + np.array([B_mean, L_mean])
+
+    # градусные ошибки
+    rmse_B = np.sqrt(np.mean((y_pred[:, 0] - y_true[:, 0]) ** 2))
+    rmse_L = np.sqrt(np.mean((y_pred[:, 1] - y_true[:, 1]) ** 2))
+
+    # пиксельные ошибки
+    pix_errs = []
+    for (E, N), (Bp, Lp) in zip(points_orig, y_pred):
+        n_pred, m_pred = rpc.forward(Bp, Lp, height)
+        lon_true, lat_true, _ = utm_to_wgs84.TransformPoint(E, N)
+        n_true, m_true = rpc.forward(lat_true, lon_true, height)
+        pix_errs.append(np.hypot(m_pred - m_true, n_pred - n_true))
+    pix_errs = np.array(pix_errs)
+    rmse_pix = np.sqrt(np.mean(pix_errs ** 2))
+    max_pix = np.max(pix_errs)
+
+    return rmse_B, rmse_L, rmse_pix, max_pix
 
 # ------------------------------------------------------------
 #  Основная функция
 # ------------------------------------------------------------
-def run_approximation(rpc, height, utm_to_wgs84, wgs84_to_utm, grid_info):
-    # Ищем tiff-файл в текущей папке
-    import glob
+def run_approximation(rpc, height, utm_to_wgs84, wgs84_to_utm, grid_info,
+                      optimizer_type='sgd', lr=0.001, momentum=0.95, weight_decay=0.0,
+                      epochs=100000, batch_size=8, patience=1000,
+                      coef=4, max_points=16384*2, model_save_path='best_mlp.pth'):
+    # Поиск TIFF
     tiff_files = glob.glob("*.tif") + glob.glob("*.tiff")
     if not tiff_files:
         raise FileNotFoundError("TIFF не найден, положите его рядом с main.py")
@@ -121,134 +158,161 @@ def run_approximation(rpc, height, utm_to_wgs84, wgs84_to_utm, grid_info):
     print(f"\nИспользую TIFF: {tiff_path}")
 
     geotf = grid_info['gt']
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Устройство: {device}")
 
-    print("\n" + "="*60)
-    print("3.7 Аппроксимация обратного проектирования по значащим пикселям")
-    print("="*60)
-
-    # Генерация выборок
-    train_points, test_points = generate_datasets_from_tiff(tiff_path, geotf, coef = 8, max_points = 256)
+    # Генерация данных
+    train_points, test_points = generate_datasets_from_tiff(tiff_path, geotf,
+                                                           coef=coef,
+                                                           max_points=max_points)
     print(f"Обучающих точек: {len(train_points)}")
     print(f"Тестовых точек: {len(test_points)}")
 
     y_train = exact_bl(train_points, utm_to_wgs84)
-    y_test  = exact_bl(test_points, utm_to_wgs84)
+    y_test = exact_bl(test_points, utm_to_wgs84)
 
-    # Нормализация
-    E_min, E_max = train_points[:,0].min(), train_points[:,0].max()
-    N_min, N_max = train_points[:,1].min(), train_points[:,1].max()
-    E_center, E_scale = (E_min + E_max)/2, (E_max - E_min)/2
-    N_center, N_scale = (N_min + N_max)/2, (N_max - N_min)/2
+    # Нормализация входов
+    E_min, E_max = train_points[:, 0].min(), train_points[:, 0].max()
+    N_min, N_max = train_points[:, 1].min(), train_points[:, 1].max()
+    E_center = (E_min + E_max) / 2.0
+    E_scale = (E_max - E_min) / 2.0
+    N_center = (N_min + N_max) / 2.0
+    N_scale = (N_max - N_min) / 2.0
 
-    B_mean, B_std = y_train[:,0].mean(), y_train[:,0].std()
-    L_mean, L_std = y_train[:,1].mean(), y_train[:,1].std()
+    # Нормализация выходов (B, L)
+    B_mean = y_train[:, 0].mean()
+    B_std = y_train[:, 0].std()
+    L_mean = y_train[:, 1].mean()
+    L_std = y_train[:, 1].std()
 
-    def norm_utm(points):
-        E_n = (points[:,0] - E_center) / E_scale
-        N_n = (points[:,1] - N_center) / N_scale
-        return np.column_stack([E_n, N_n])
+    # Подготовка тензоров
+    X_tr = np.column_stack([
+        (train_points[:, 0] - E_center) / E_scale,
+        (train_points[:, 1] - N_center) / N_scale
+    ])
+    X_te = np.column_stack([
+        (test_points[:, 0] - E_center) / E_scale,
+        (test_points[:, 1] - N_center) / N_scale
+    ])
+    y_tr_norm = np.column_stack([
+        (y_train[:, 0] - B_mean) / B_std,
+        (y_train[:, 1] - L_mean) / L_std
+    ])
+    y_te_norm = np.column_stack([
+        (y_test[:, 0] - B_mean) / B_std,
+        (y_test[:, 1] - L_mean) / L_std
+    ])
 
-    def norm_bl(y):
-        return np.column_stack([(y[:,0] - B_mean) / B_std,
-                                 (y[:,1] - L_mean) / L_std])
+    # Переводим в torch
+    X_tr_t = torch.tensor(X_tr, dtype=torch.float32)
+    y_tr_t = torch.tensor(y_tr_norm, dtype=torch.float32)
+    X_te_t = torch.tensor(X_te, dtype=torch.float32)
+    y_te_t = torch.tensor(y_te_norm, dtype=torch.float32)
 
-    def denorm_bl(y_norm):
-        return np.column_stack([y_norm[:,0] * B_std + B_mean,
-                                 y_norm[:,1] * L_std + L_mean])
+    train_dataset = TensorDataset(X_tr_t, y_tr_t)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
-    X_tr = norm_utm(train_points)
-    X_te = norm_utm(test_points)
-    y_tr_n = norm_bl(y_train)
-    y_te_n = norm_bl(y_test)
+    # Модель
+    layer_sizes = [2, 64, 64, 64, 64, 2]
+    model = MLP(layer_sizes).to(device)
+    criterion = nn.MSELoss()
 
-    # Сеть
-    rng_key = random.PRNGKey(42)
-    layer_sizes = [2, 8, 8, 8, 2]
-    params = init_mlp_params(rng_key, layer_sizes)
-    velocity = init_momentum(params)
+    # Оптимизатор
+    if optimizer_type.lower() == 'sgd':
+        optimizer = optim.SGD(model.parameters(), lr=lr, momentum=momentum,
+                              weight_decay=weight_decay)
+    elif optimizer_type.lower() == 'adam':
+        optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    else:
+        raise ValueError("optimizer_type должен быть 'sgd' или 'adam'")
 
-    lr = 0.001
-    momentum = 0.5
-    epochs = 100000
-    batch_size = 16
+    # Параметры для денормализации
+    denorm_params = (B_mean, B_std, L_mean, L_std)
 
-    @jit
-    def predict(params, X):
-        return vmap(partial(mlp_forward, params))(X)
-
-    # Функция для расчёта пиксельной ошибки
-    def compute_pixel_error(params, points_orig, X_norm):
-        y_pred_norm = predict(params, jnp.array(X_norm))
-        y_pred = denorm_bl(np.array(y_pred_norm))
-        errs = []
-        for (E, N), (Bp, Lp) in zip(points_orig, y_pred):
-            n_pred, m_pred = rpc.forward(Bp, Lp, height)
-            lon_true, lat_true, _ = utm_to_wgs84.TransformPoint(E, N)
-            n_true, m_true = rpc.forward(lat_true, lon_true, height)
-            errs.append(np.hypot(m_pred - m_true, n_pred - n_true))
-        errs = np.array(errs)
-        return errs.mean(), errs.max()
-
-    print(f"Обучение MLP ({epochs} эпох, lr={lr}, momentum={momentum})...")
-    best_test_mean = float('inf')
-    best_params = params
+    # Ранняя остановка
+    best_val_metric = float('inf')
     best_epoch = 0
+    patience_counter = 0
+    best_state = None
 
-    for epoch in range(epochs):
-        perm = np.random.permutation(len(X_tr))
-        X_shuf = jnp.array(X_tr[perm])
-        y_shuf = jnp.array(y_tr_n[perm])
+    print(f"Обучение MLP ({epochs} эпох, optim={optimizer_type}, lr={lr}, batch={batch_size})...")
+    for epoch in range(1, epochs + 1):
+        model.train()
         total_loss = 0.0
-        for i in range(0, len(X_shuf), batch_size):
-            xb = X_shuf[i:i+batch_size]
-            yb = y_shuf[i:i+batch_size]
-            loss, grads = value_and_grad(mse_loss)(params, xb, yb)
-            params, velocity = momentum_update(params, grads, velocity, lr, momentum)
-            total_loss += loss * len(xb)
+        for xb, yb in train_loader:
+            xb, yb = xb.to(device), yb.to(device)
+            optimizer.zero_grad()
+            pred = model(xb)
+            loss = criterion(pred, yb)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item() * xb.size(0)
 
-        if (epoch+1) % 100 == 0:
-            train_mean, train_max = compute_pixel_error(params, train_points, X_tr)
-            test_mean, test_max = compute_pixel_error(params, test_points, X_te)
-            print(f"  эпоха {epoch+1:5d}: loss={total_loss/len(X_shuf):.8f} "
-                  f"train_err(mean/max)={train_mean:.4f}/{train_max:.4f} px "
-                  f"test_err(mean/max)={test_mean:.4f}/{test_max:.4f} px")
-            if test_mean < best_test_mean:
-                best_test_mean = test_mean
-                best_params = params
-                best_epoch = epoch+1
+        avg_loss = total_loss / len(train_dataset)
 
-    params = best_params
-    print(f"\nЛучшая модель на эпохе {best_epoch}, test_mean_error = {best_test_mean:.4f} px")
+        # Оценка каждые 100 эпох
+        if epoch % 100 == 0:
+            # Ошибки на train
+            train_rmse_B, train_rmse_L, train_rmse_pix, train_max_pix = compute_metrics(
+                model, train_points, X_tr, y_train, denorm_params,
+                rpc, height, utm_to_wgs84, device)
+            # Ошибки на test
+            test_rmse_B, test_rmse_L, test_rmse_pix, test_max_pix = compute_metrics(
+                model, test_points, X_te, y_test, denorm_params,
+                rpc, height, utm_to_wgs84, device)
 
-    # Итоговая оценка
-    def compute_errors(points_orig, y_pred_norm):
-        y_pred = denorm_bl(np.array(y_pred_norm))
-        y_true = exact_bl(points_orig, utm_to_wgs84)
-        rmse_B = np.sqrt(np.mean((y_pred[:,0]-y_true[:,0])**2))
-        rmse_L = np.sqrt(np.mean((y_pred[:,1]-y_true[:,1])**2))
-        pix_errs = []
-        for (E,N), (Bp,Lp) in zip(points_orig, y_pred):
-            n_pred, m_pred = rpc.forward(Bp, Lp, height)
-            lon_true, lat_true, _ = utm_to_wgs84.TransformPoint(E, N)
-            n_true, m_true = rpc.forward(lat_true, lon_true, height)
-            pix_errs.append(np.hypot(m_pred-m_true, n_pred-n_true))
-        pix_errs = np.array(pix_errs)
-        rmse_pix = np.sqrt(np.mean(pix_errs**2))
-        max_pix = np.max(pix_errs)
-        return rmse_B, rmse_L, rmse_pix, max_pix
+            print(f"Эпоха {epoch:5d}: loss={avg_loss:.6f} | "
+                  f"train B RMSE={train_rmse_B:.6e}° L RMSE={train_rmse_L:.6e}° "
+                  f"pix err mean={train_rmse_pix:.4f} max={train_max_pix:.4f} | "
+                  f"test  B RMSE={test_rmse_B:.6e}° L RMSE={test_rmse_L:.6e}° "
+                  f"pix err mean={test_rmse_pix:.4f} max={test_max_pix:.4f}")
 
-    results = {}
-    for name, pts, X_n in [('train', train_points, X_tr),
-                           ('test', test_points, X_te)]:
-        y_pred_norm = predict(params, jnp.array(X_n))
-        b, l, p, mp = compute_errors(pts, y_pred_norm)
-        results[name] = (len(pts), b, l, p, mp)
+            # Метрика для ранней остановки: сумма градусных RMSE на тесте
+            val_metric = test_rmse_B + test_rmse_L
+            if val_metric < best_val_metric:
+                best_val_metric = val_metric
+                best_epoch = epoch
+                patience_counter = 0
+                # Сохраняем лучшую модель
+                best_state = {
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'best_val_metric': best_val_metric,
+                    'denorm_params': denorm_params,
+                    'normalization': {
+                        'E_center': E_center, 'E_scale': E_scale,
+                        'N_center': N_center, 'N_scale': N_scale
+                    }
+                }
+                torch.save(best_state, model_save_path)
+                print(f"  -> сохранена лучшая модель (метрика B+L = {best_val_metric:.6e}°)")
+            else:
+                patience_counter += 1
+                if patience_counter >= patience // 100:  # терпение в периодах по 100 эпох
+                    print(f"Ранняя остановка на эпохе {epoch}: нет улучшений {patience_counter * 100} эпох.")
+                    break
 
+    # Загружаем лучшую модель
+    if best_state is not None:
+        model.load_state_dict(best_state['model_state_dict'])
+        print(f"\nЛучшая модель с эпохи {best_epoch}, метрика B+L = {best_val_metric:.6e}°")
+    else:
+        print("\nЛучшая модель не найдена, используется последняя.")
+
+    # Финальные метрики
     print("\nРезультаты аппроксимации:")
     print(f"{'Выборка':<10} {'N':<8} {'RMSE_B (град)':<15} {'RMSE_L (град)':<15} "
           f"{'RMSE пикс':<12} {'Макс. ошибка, пикс':<20}")
-    for name in ['train', 'test']:
-        n, b, l, p, mp = results[name]
-        print(f"{name:<10} {n:<8} {b:<15.6e} {l:<15.6e} {p:<12.6f} {mp:<20.6f}")
+    for name, pts, X_n, y_true in [
+        ('train', train_points, X_tr, y_train),
+        ('test', test_points, X_te, y_test)
+    ]:
+        b, l, p, mp = compute_metrics(model, pts, X_n, y_true, denorm_params,
+                                      rpc, height, utm_to_wgs84, device)
+        print(f"{name:<10} {len(pts):<8} {b:<15.6e} {l:<15.6e} {p:<12.6f} {mp:<20.6f}")
 
-    return results
+    return {
+        'train': (len(train_points), b, l, p, mp),
+        'test': (len(test_points), b, l, p, mp)
+    }
