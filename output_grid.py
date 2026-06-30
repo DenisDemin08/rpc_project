@@ -13,7 +13,7 @@ def compute_pixel_size_in_utm(rpc, height, wgs84_to_utm):
 
     dist_m = np.hypot(E_m1 - E_c, N_m1 - N_c)
     dist_n = np.hypot(E_n1 - E_c, N_n1 - N_c)
-    return float(dist_m), float(dist_n)   # гарантируем обычный float
+    return float(dist_m), float(dist_n)
 
 def run(rpc, height, utm_to_wgs84, wgs84_to_utm):
     w, h = rpc.width, rpc.height
