@@ -8,3 +8,10 @@
 ## Ошибка в метриках
 В старой версии таблицы 10 средняя ошибка и RMSE совпадали, так как в коде вычислялась только одна величина и выводилась под двумя именами.
 Для исправления создана функция `error_stats` в `approx/metrics.py`, которая честно считает `mean`, `rmse`, `p95` и `max`. Теперь все метрики вычисляются через нее.
+Вывод pytest:
+collected 2 items                                                                                     
+
+tests/test_rpc.py::test_forward_vs_gdal PASSED                                                  [ 50%]
+tests/test_rpc.py::test_inverse_roundtrip PASSED                                                [100%]
+
+2 passed in 0.75s 
