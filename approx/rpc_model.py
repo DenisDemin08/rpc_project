@@ -34,7 +34,7 @@ class RPC:
 
     def _monomials(self, P, L, H):
         return np.array([
-            1.0, L, P, H,
+            np.ones_like(P), L, P, H,
             L*P, L*H, P*H,
             L**2, P**2, H**2,
             P*L*H, L**3, L*P**2, L*H**2,
@@ -68,8 +68,9 @@ class RPC:
         u = self._monomials(P, L, H)
         Y = np.dot(self.c, u) / np.dot(self.d, u)
         X = np.dot(self.e, u) / np.dot(self.f, u)
-        n = Y * self.LINE_SCALE + self.LINE_OFF
-        m = X * self.SAMP_SCALE + self.SAMP_OFF
+
+        n = Y * self.LINE_SCALE + self.LINE_OFF + 0.5
+        m = X * self.SAMP_SCALE + self.SAMP_OFF + 0.5
         return n, m
 
     def forward_mn(self, lat, lon, height):
@@ -104,8 +105,9 @@ class RPC:
 
         J = np.array([[dn_dlat, dn_dlon],
                       [dm_dlat, dm_dlon]])
-        n = Y * self.LINE_SCALE + self.LINE_OFF
-        m = X * self.SAMP_SCALE + self.SAMP_OFF
+        
+        n = Y * self.LINE_SCALE + self.LINE_OFF + 0.5
+        m = X * self.SAMP_SCALE + self.SAMP_OFF + 0.5
         return n, m, J
 
     def inverse(self, n, m, height, lat_init=None, lon_init=None, max_iter=100, tol=1e-6):
@@ -128,5 +130,5 @@ class RPC:
         return lat, lon, max_iter, False
 
     def inverse_mn(self, m, n, height, lat_init=None, lon_init=None, max_iter=100, tol=1e-6):
-        """Обёртка inverse с порядком (m,n)"""
+        """Обертка inverse с порядком (m,n)"""
         return self.inverse(n, m, height, lat_init, lon_init, max_iter, tol)
