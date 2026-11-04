@@ -57,6 +57,7 @@ class RPC:
         self._du_dL = du_dL
 
     def normalize(self, lat, lon, height):
+        lat, lon, height = np.broadcast_arrays(lat, lon, height)
         P = (lat - self.LAT_OFF) / self.LAT_SCALE
         L = (lon - self.LONG_OFF) / self.LONG_SCALE
         H = (height - self.HEIGHT_OFF) / self.HEIGHT_SCALE
